@@ -65,7 +65,7 @@ Each node sends a heartbeat every round. The detector marks a node as partitione
 current_round − last_seen[node] > timeout_rounds
 ```
 
-A **quorum** exists when the number of alive nodes ≥ ⌈(2N + 1)/3⌉ (Byzantine quorum) or > N/2 (crash-fault quorum).
+A **quorum** exists when more than half the nodes are alive (`alive > N/2`, the crash-fault majority quorum implemented by `has_quorum()`). The Byzantine bound `⌈(2N + 1)/3⌉` is **not** implemented — this crate targets crash-fault tolerance only.
 
 **Complexity:** O(1) per heartbeat update. O(N) to check all nodes.
 
@@ -97,7 +97,7 @@ The ternary sum replaces the majority-counting of binary Paxos. The magnitude |�
 
 **Complexity:** O(N) messages per phase. O(N) to tally votes. Total: O(N) per consensus instance.
 
-**Fault tolerance:** Tolerates f < N/3 crash failures (same as binary Paxos), where N = 3f + 1.
+**Fault tolerance:** Tolerates `f < N/2` crash failures (majority quorum, `⌊N/2⌋ + 1` accepts required to choose a value). This is the crash-fault bound; it does not tolerate Byzantine (arbitrary) faults, which would require the `f < N/3` bound and signed/validated votes that this crate does not implement.
 
 ### Anti-Entropy Synchronization
 

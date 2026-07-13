@@ -5,6 +5,50 @@
 //! Provides node management, gossip propagation, vector clocks, partition detection,
 //! consensus, and anti-entropy synchronization — all built around the ternary value
 //! space {-1, 0, +1}.
+//!
+//! # Example (mirrors the README Quick Start)
+//!
+//! ```
+//! use ternary_distributed::*;
+//!
+//! // Build a 5-node cluster
+//! let mut gossip = GossipProtocol::new();
+//! for i in 1..=5u64 {
+//!     let mut node = TernaryNode::new(i);
+//!     for j in 1..=5u64 {
+//!         if i != j {
+//!             node.add_peer(j);
+//!         }
+//!     }
+//!     gossip.add_node(node);
+//! }
+//!
+//! // Seed node 1 with positive state
+//! gossip.nodes.get_mut(&1).unwrap().set_state(Trit::Pos);
+//!
+//! // Run gossip until convergence
+//! let _rounds = gossip.run_until_converged(20);
+//! assert!(gossip.is_converged());
+//!
+//! // Consensus
+//! let mut cp = ConsensusProtocol::new(&[1, 2, 3, 4, 5]);
+//! let proposal = cp.prepare(1);
+//! for i in 1..=5u64 {
+//!     cp.promise(i, proposal);
+//! }
+//! cp.accept(1, proposal, Vote::Positive);
+//! cp.accept(2, proposal, Vote::Positive);
+//! cp.accept(3, proposal, Vote::Positive);
+//! assert_eq!(cp.decide(), Some(Vote::Positive));
+//!
+//! // Partition detection
+//! let mut pd = PartitionDetector::new(5, 3);
+//! for i in 1..=5u64 {
+//!     pd.heartbeat(i);
+//! }
+//! pd.advance_round();
+//! assert!(pd.has_quorum());
+//! ```
 
 use std::collections::{HashMap, HashSet};
 
@@ -161,6 +205,12 @@ impl GossipProtocol {
     }
 }
 
+impl Default for GossipProtocol {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Returns the dominant non-zero trit from a list. Ties broken toward Pos.
 fn dominant_trit(trits: &[Trit]) -> Option<Trit> {
     let mut neg = 0u32;
@@ -243,6 +293,12 @@ impl VectorClock {
     /// Returns true if self and other are concurrent (neither happened-before the other).
     pub fn is_concurrent(&self, other: &VectorClock) -> bool {
         !self.happened_before(other) && !other.happened_before(self) && self != other
+    }
+}
+
+impl Default for VectorClock {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -409,30 +465,31 @@ impl ConsensusProtocol {
                 return false;
             }
         }
-        self.accepted_value
-            .insert(acceptor, (proposal_num, value));
+        self.accepted_value.insert(acceptor, (proposal_num, value));
         true
     }
 
     pub fn decide(&self) -> Option<Vote> {
-        let values: Vec<&(u64, Vote)> = self.accepted_value.values().collect();
-        if values.len() < self.quorum_size {
-            return None;
-        }
-
-        // Find the highest proposal number with quorum
+        // Group all accepted values by their proposal number. A value is *chosen*
+        // when a quorum of acceptors accept the SAME proposal number.
         let mut proposal_counts: HashMap<u64, Vec<Vote>> = HashMap::new();
-        for (num, vote) in &values {
+        for (num, vote) in self.accepted_value.values() {
             proposal_counts.entry(*num).or_default().push(*vote);
         }
 
-        let max_proposal = proposal_counts.keys().max()?;
-        let votes = proposal_counts.get(max_proposal)?;
-        if votes.len() < self.quorum_size {
-            return None;
-        }
+        // Among proposals that actually reached a quorum, pick the highest number.
+        // Using the absolute max proposal number is wrong: a newer proposal that
+        // never reached quorum must not mask an earlier, already-chosen value.
+        let chosen_votes = proposal_counts
+            .into_iter()
+            .filter(|(_, votes)| votes.len() >= self.quorum_size)
+            .max_by_key(|(num, _)| *num)
+            .map(|(_, votes)| votes)?;
 
-        let sum: i32 = votes.iter().map(|v| v.to_trit().to_i8() as i32).sum();
+        let sum: i32 = chosen_votes
+            .iter()
+            .map(|v| v.to_trit().to_i8() as i32)
+            .sum();
         if sum < 0 {
             Some(Vote::Negative)
         } else if sum > 0 {
@@ -542,17 +599,24 @@ impl AntiEntropySync {
             for j in (i + 1)..node_ids.len() {
                 let a_id = node_ids[i];
                 let b_id = node_ids[j];
-                let a = self.nodes.get(&a_id).unwrap();
-                let b = self.nodes.get(&b_id).unwrap();
-                if a.peers.contains(&b_id) || b.peers.contains(&a_id) {
-                    if self.sync_pair(a_id, b_id) {
-                        changes += 1;
-                    }
+                let connected = {
+                    let a = self.nodes.get(&a_id).unwrap();
+                    let b = self.nodes.get(&b_id).unwrap();
+                    a.peers.contains(&b_id) || b.peers.contains(&a_id)
+                };
+                if connected && self.sync_pair(a_id, b_id) {
+                    changes += 1;
                 }
             }
         }
 
         changes
+    }
+}
+
+impl Default for AntiEntropySync {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -733,6 +797,51 @@ mod tests {
     }
 
     #[test]
+    fn test_partition_detector_timeout_boundary() {
+        // is_alive uses `current_round - last_seen <= timeout`. Verify the
+        // exact boundary: alive at exactly `timeout_rounds`, dead one round
+        // later. Also exercise alive_nodes() vs partitioned_nodes().
+        let mut pd = PartitionDetector::new(3, 2);
+        pd.heartbeat(1);
+        pd.heartbeat(2);
+        pd.heartbeat(3);
+
+        // Advance to exactly the timeout: still alive.
+        pd.advance_round(); // round 1
+        pd.advance_round(); // round 2
+        assert_eq!(pd.current_round, 2);
+        assert!(pd.is_alive(1));
+        assert_eq!(pd.alive_nodes().len(), 3);
+        assert_eq!(pd.partitioned_nodes().len(), 0);
+
+        // One more round: now timed out.
+        pd.advance_round(); // round 3
+        assert!(!pd.is_alive(1));
+        assert_eq!(pd.alive_nodes().len(), 0);
+        assert_eq!(pd.partitioned_nodes().len(), 3);
+    }
+
+    #[test]
+    fn test_partition_detector_unknown_node_not_alive() {
+        // A node we have never heard from is not alive and not counted.
+        let pd = PartitionDetector::new(3, 2);
+        assert!(!pd.is_alive(99));
+        assert_eq!(pd.alive_nodes().len(), 0);
+    }
+
+    #[test]
+    fn test_partition_detector_quorum_strict_majority() {
+        // has_quorum requires a STRICT majority (alive*2 > total).
+        let mut pd = PartitionDetector::new(4, 5);
+        pd.heartbeat(1);
+        pd.heartbeat(2);
+        assert_eq!(pd.alive_nodes().len(), 2);
+        assert!(!pd.has_quorum(), "2 of 4 is exactly half, not a quorum");
+        pd.heartbeat(3);
+        assert!(pd.has_quorum(), "3 of 4 is a strict majority");
+    }
+
+    #[test]
     fn test_consensus_prepare_promise() {
         let mut cp = ConsensusProtocol::new(&[1, 2, 3]);
         let proposal = cp.prepare(1);
@@ -770,25 +879,134 @@ mod tests {
 
     #[test]
     fn test_consensus_no_quorum() {
-        let mut cp = ConsensusProtocol::new(&[1, 2, 3]);
+        let cp = ConsensusProtocol::new(&[1, 2, 3]);
         assert_eq!(cp.decide(), None);
     }
 
     #[test]
+    fn test_consensus_decide_ignores_non_quorum_reproposal() {
+        // Regression: an earlier proposal that reached quorum must still be
+        // reported as chosen even if a later, higher-numbered proposal is
+        // accepted by fewer than a quorum of acceptors. Previously decide()
+        // keyed off the absolute max proposal number and returned None here.
+        let mut cp = ConsensusProtocol::new(&[1, 2, 3, 4, 5]); // quorum = 3
+        let p1 = cp.prepare(1);
+        for i in 1..=5 {
+            cp.promise(i, p1);
+        }
+        // Proposal 1 reaches a quorum of Positive accepts => value is chosen.
+        cp.accept(1, p1, Vote::Positive);
+        cp.accept(2, p1, Vote::Positive);
+        cp.accept(3, p1, Vote::Positive);
+        assert_eq!(cp.decide(), Some(Vote::Positive));
+
+        // A re-proposal with a higher number that fails to reach quorum must
+        // NOT mask the already-chosen value.
+        let p2 = cp.prepare(1);
+        assert!(p2 > p1);
+        cp.accept(4, p2, Vote::Negative); // only 1 accept for proposal 2
+        assert_eq!(cp.decide(), Some(Vote::Positive));
+    }
+
+    #[test]
+    fn test_consensus_promise_rejects_lower_proposal() {
+        // promise() must reject any proposal numbered lower than the highest
+        // already promised (Paxos ballot invariant).
+        let mut cp = ConsensusProtocol::new(&[1, 2, 3]);
+        assert!(cp.promise(1, 5));
+        assert!(!cp.promise(1, 3)); // lower => rejected
+        assert!(cp.promise(1, 5)); // equal => allowed
+        assert!(cp.promise(1, 7)); // higher => allowed
+    }
+
+    #[test]
+    fn test_consensus_accept_rejects_below_promise() {
+        // accept() must reject a proposal numbered below the acceptor's
+        // last promise.
+        let mut cp = ConsensusProtocol::new(&[1, 2, 3]);
+        cp.promise(1, 5);
+        assert!(!cp.accept(1, 3, Vote::Positive)); // below promise
+        assert!(cp.accept(1, 5, Vote::Positive)); // equal to promise
+        assert!(cp.accept(1, 9, Vote::Positive)); // above promise
+    }
+
+    #[test]
+    fn test_consensus_mixed_votes_sum_to_abstain() {
+        // Equal Pos and Neg votes within a chosen quorum sum to 0 => Abstain.
+        let mut cp = ConsensusProtocol::new(&[1, 2, 3, 4]); // quorum = 3
+        let p = cp.prepare(1);
+        for i in 1..=4 {
+            cp.promise(i, p);
+        }
+        cp.accept(1, p, Vote::Positive);
+        cp.accept(2, p, Vote::Negative);
+        cp.accept(3, p, Vote::Positive);
+        cp.accept(4, p, Vote::Negative);
+        // 2 Pos + 2 Neg => sum 0 => Abstain.
+        assert_eq!(cp.decide(), Some(Vote::Abstain));
+    }
+
+    #[test]
     fn test_anti_entropy_sync_pair() {
+        // Construct an actual causal relationship: n2 has a tick on its own
+        // counter, n1 has none, so vc(n1) happened-before vc(n2). Sync must
+        // bring n1 forward to adopt n2's state and advance n1's clock.
         let mut sync = AntiEntropySync::new();
         let mut n1 = TernaryNode::with_state(1, Trit::Pos);
         n1.add_peer(2);
-        let mut n2 = TernaryNode::new(2);
+        let mut n2 = TernaryNode::with_state(2, Trit::Neg);
         n2.add_peer(1);
-        n2.vector_clock.increment(2); // Give n2 a clock
+        n2.vector_clock.increment(2); // n2 is causally newer
         sync.add_node(n1);
         sync.add_node(n2);
+
+        let changed = sync.sync_pair(1, 2);
+        assert!(changed, "sync_pair should report a change");
+
+        // n1 (behind) adopts n2's state; n2 (ahead) is unchanged.
+        assert_eq!(sync.nodes.get(&1).unwrap().state, Trit::Neg);
+        assert_eq!(sync.nodes.get(&2).unwrap().state, Trit::Neg);
+        // n1's clock must have advanced past its previously-empty state.
+        assert!(sync.nodes.get(&1).unwrap().vector_clock.get(1) >= 1);
+        assert!(sync.nodes.get(&1).unwrap().vector_clock.get(2) >= 1);
+    }
+
+    #[test]
+    fn test_anti_entropy_sync_pair_concurrent() {
+        // Two nodes with concurrent clocks (each ticked its own counter) must
+        // reconcile to the dominant trit.
+        let mut sync = AntiEntropySync::new();
+        let mut n1 = TernaryNode::with_state(1, Trit::Pos);
+        n1.add_peer(2);
+        n1.vector_clock.increment(1);
+        let mut n2 = TernaryNode::with_state(2, Trit::Neg);
+        n2.add_peer(1);
+        n2.vector_clock.increment(2);
+        sync.add_node(n1);
+        sync.add_node(n2);
+
+        // dominant_trit([Pos, Neg]) ties toward Pos.
         sync.sync_pair(1, 2);
-        // n2 should adopt n1's state since n1 has state set via with_state
-        // but n1's vc is empty while n2 has a tick
-        let state2 = sync.nodes.get(&2).unwrap().state;
-        assert_eq!(state2, Trit::Zero); // n2 already zero, n1 has no vc ticks
+        assert_eq!(sync.nodes.get(&1).unwrap().state, Trit::Pos);
+        assert_eq!(sync.nodes.get(&2).unwrap().state, Trit::Pos);
+    }
+
+    #[test]
+    fn test_anti_entropy_sync_pair_noop_when_equal() {
+        // Identical state + clock: sync_pair must report no change and not
+        // spuriously advance clocks.
+        let mut sync = AntiEntropySync::new();
+        let mut n1 = TernaryNode::with_state(1, Trit::Pos);
+        n1.add_peer(2);
+        n1.vector_clock.increment(1);
+        let mut n2 = TernaryNode::with_state(2, Trit::Pos);
+        n2.add_peer(1);
+        n2.vector_clock.increment(1);
+        sync.add_node(n1);
+        sync.add_node(n2);
+
+        let changed = sync.sync_pair(1, 2);
+        assert!(!changed);
     }
 
     #[test]
@@ -803,8 +1021,14 @@ mod tests {
 
     #[test]
     fn test_dominant_trit() {
-        assert_eq!(dominant_trit(&[Trit::Pos, Trit::Pos, Trit::Neg]), Some(Trit::Pos));
-        assert_eq!(dominant_trit(&[Trit::Neg, Trit::Neg, Trit::Pos]), Some(Trit::Neg));
+        assert_eq!(
+            dominant_trit(&[Trit::Pos, Trit::Pos, Trit::Neg]),
+            Some(Trit::Pos)
+        );
+        assert_eq!(
+            dominant_trit(&[Trit::Neg, Trit::Neg, Trit::Pos]),
+            Some(Trit::Neg)
+        );
         assert_eq!(dominant_trit(&[Trit::Zero, Trit::Zero]), None);
         assert_eq!(dominant_trit(&[]), None);
     }
