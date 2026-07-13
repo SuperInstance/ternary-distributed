@@ -5,6 +5,50 @@
 //! Provides node management, gossip propagation, vector clocks, partition detection,
 //! consensus, and anti-entropy synchronization — all built around the ternary value
 //! space {-1, 0, +1}.
+//!
+//! # Example (mirrors the README Quick Start)
+//!
+//! ```
+//! use ternary_distributed::*;
+//!
+//! // Build a 5-node cluster
+//! let mut gossip = GossipProtocol::new();
+//! for i in 1..=5u64 {
+//!     let mut node = TernaryNode::new(i);
+//!     for j in 1..=5u64 {
+//!         if i != j {
+//!             node.add_peer(j);
+//!         }
+//!     }
+//!     gossip.add_node(node);
+//! }
+//!
+//! // Seed node 1 with positive state
+//! gossip.nodes.get_mut(&1).unwrap().set_state(Trit::Pos);
+//!
+//! // Run gossip until convergence
+//! let _rounds = gossip.run_until_converged(20);
+//! assert!(gossip.is_converged());
+//!
+//! // Consensus
+//! let mut cp = ConsensusProtocol::new(&[1, 2, 3, 4, 5]);
+//! let proposal = cp.prepare(1);
+//! for i in 1..=5u64 {
+//!     cp.promise(i, proposal);
+//! }
+//! cp.accept(1, proposal, Vote::Positive);
+//! cp.accept(2, proposal, Vote::Positive);
+//! cp.accept(3, proposal, Vote::Positive);
+//! assert_eq!(cp.decide(), Some(Vote::Positive));
+//!
+//! // Partition detection
+//! let mut pd = PartitionDetector::new(5, 3);
+//! for i in 1..=5u64 {
+//!     pd.heartbeat(i);
+//! }
+//! pd.advance_round();
+//! assert!(pd.has_quorum());
+//! ```
 
 use std::collections::{HashMap, HashSet};
 
