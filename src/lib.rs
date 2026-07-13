@@ -426,24 +426,26 @@ impl ConsensusProtocol {
     }
 
     pub fn decide(&self) -> Option<Vote> {
-        let values: Vec<&(u64, Vote)> = self.accepted_value.values().collect();
-        if values.len() < self.quorum_size {
-            return None;
-        }
-
-        // Find the highest proposal number with quorum
+        // Group all accepted values by their proposal number. A value is *chosen*
+        // when a quorum of acceptors accept the SAME proposal number.
         let mut proposal_counts: HashMap<u64, Vec<Vote>> = HashMap::new();
-        for (num, vote) in &values {
+        for (num, vote) in self.accepted_value.values() {
             proposal_counts.entry(*num).or_default().push(*vote);
         }
 
-        let max_proposal = proposal_counts.keys().max()?;
-        let votes = proposal_counts.get(max_proposal)?;
-        if votes.len() < self.quorum_size {
-            return None;
-        }
+        // Among proposals that actually reached a quorum, pick the highest number.
+        // Using the absolute max proposal number is wrong: a newer proposal that
+        // never reached quorum must not mask an earlier, already-chosen value.
+        let chosen_votes = proposal_counts
+            .into_iter()
+            .filter(|(_, votes)| votes.len() >= self.quorum_size)
+            .max_by_key(|(num, _)| *num)
+            .map(|(_, votes)| votes)?;
 
-        let sum: i32 = votes.iter().map(|v| v.to_trit().to_i8() as i32).sum();
+        let sum: i32 = chosen_votes
+            .iter()
+            .map(|v| v.to_trit().to_i8() as i32)
+            .sum();
         if sum < 0 {
             Some(Vote::Negative)
         } else if sum > 0 {
@@ -790,6 +792,69 @@ mod tests {
     fn test_consensus_no_quorum() {
         let cp = ConsensusProtocol::new(&[1, 2, 3]);
         assert_eq!(cp.decide(), None);
+    }
+
+    #[test]
+    fn test_consensus_decide_ignores_non_quorum_reproposal() {
+        // Regression: an earlier proposal that reached quorum must still be
+        // reported as chosen even if a later, higher-numbered proposal is
+        // accepted by fewer than a quorum of acceptors. Previously decide()
+        // keyed off the absolute max proposal number and returned None here.
+        let mut cp = ConsensusProtocol::new(&[1, 2, 3, 4, 5]); // quorum = 3
+        let p1 = cp.prepare(1);
+        for i in 1..=5 {
+            cp.promise(i, p1);
+        }
+        // Proposal 1 reaches a quorum of Positive accepts => value is chosen.
+        cp.accept(1, p1, Vote::Positive);
+        cp.accept(2, p1, Vote::Positive);
+        cp.accept(3, p1, Vote::Positive);
+        assert_eq!(cp.decide(), Some(Vote::Positive));
+
+        // A re-proposal with a higher number that fails to reach quorum must
+        // NOT mask the already-chosen value.
+        let p2 = cp.prepare(1);
+        assert!(p2 > p1);
+        cp.accept(4, p2, Vote::Negative); // only 1 accept for proposal 2
+        assert_eq!(cp.decide(), Some(Vote::Positive));
+    }
+
+    #[test]
+    fn test_consensus_promise_rejects_lower_proposal() {
+        // promise() must reject any proposal numbered lower than the highest
+        // already promised (Paxos ballot invariant).
+        let mut cp = ConsensusProtocol::new(&[1, 2, 3]);
+        assert!(cp.promise(1, 5));
+        assert!(!cp.promise(1, 3)); // lower => rejected
+        assert!(cp.promise(1, 5)); // equal => allowed
+        assert!(cp.promise(1, 7)); // higher => allowed
+    }
+
+    #[test]
+    fn test_consensus_accept_rejects_below_promise() {
+        // accept() must reject a proposal numbered below the acceptor's
+        // last promise.
+        let mut cp = ConsensusProtocol::new(&[1, 2, 3]);
+        cp.promise(1, 5);
+        assert!(!cp.accept(1, 3, Vote::Positive)); // below promise
+        assert!(cp.accept(1, 5, Vote::Positive)); // equal to promise
+        assert!(cp.accept(1, 9, Vote::Positive)); // above promise
+    }
+
+    #[test]
+    fn test_consensus_mixed_votes_sum_to_abstain() {
+        // Equal Pos and Neg votes within a chosen quorum sum to 0 => Abstain.
+        let mut cp = ConsensusProtocol::new(&[1, 2, 3, 4]); // quorum = 3
+        let p = cp.prepare(1);
+        for i in 1..=4 {
+            cp.promise(i, p);
+        }
+        cp.accept(1, p, Vote::Positive);
+        cp.accept(2, p, Vote::Negative);
+        cp.accept(3, p, Vote::Positive);
+        cp.accept(4, p, Vote::Negative);
+        // 2 Pos + 2 Neg => sum 0 => Abstain.
+        assert_eq!(cp.decide(), Some(Vote::Abstain));
     }
 
     #[test]
