@@ -161,6 +161,12 @@ impl GossipProtocol {
     }
 }
 
+impl Default for GossipProtocol {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Returns the dominant non-zero trit from a list. Ties broken toward Pos.
 fn dominant_trit(trits: &[Trit]) -> Option<Trit> {
     let mut neg = 0u32;
@@ -243,6 +249,12 @@ impl VectorClock {
     /// Returns true if self and other are concurrent (neither happened-before the other).
     pub fn is_concurrent(&self, other: &VectorClock) -> bool {
         !self.happened_before(other) && !other.happened_before(self) && self != other
+    }
+}
+
+impl Default for VectorClock {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -409,8 +421,7 @@ impl ConsensusProtocol {
                 return false;
             }
         }
-        self.accepted_value
-            .insert(acceptor, (proposal_num, value));
+        self.accepted_value.insert(acceptor, (proposal_num, value));
         true
     }
 
@@ -542,17 +553,24 @@ impl AntiEntropySync {
             for j in (i + 1)..node_ids.len() {
                 let a_id = node_ids[i];
                 let b_id = node_ids[j];
-                let a = self.nodes.get(&a_id).unwrap();
-                let b = self.nodes.get(&b_id).unwrap();
-                if a.peers.contains(&b_id) || b.peers.contains(&a_id) {
-                    if self.sync_pair(a_id, b_id) {
-                        changes += 1;
-                    }
+                let connected = {
+                    let a = self.nodes.get(&a_id).unwrap();
+                    let b = self.nodes.get(&b_id).unwrap();
+                    a.peers.contains(&b_id) || b.peers.contains(&a_id)
+                };
+                if connected && self.sync_pair(a_id, b_id) {
+                    changes += 1;
                 }
             }
         }
 
         changes
+    }
+}
+
+impl Default for AntiEntropySync {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -770,7 +788,7 @@ mod tests {
 
     #[test]
     fn test_consensus_no_quorum() {
-        let mut cp = ConsensusProtocol::new(&[1, 2, 3]);
+        let cp = ConsensusProtocol::new(&[1, 2, 3]);
         assert_eq!(cp.decide(), None);
     }
 
@@ -803,8 +821,14 @@ mod tests {
 
     #[test]
     fn test_dominant_trit() {
-        assert_eq!(dominant_trit(&[Trit::Pos, Trit::Pos, Trit::Neg]), Some(Trit::Pos));
-        assert_eq!(dominant_trit(&[Trit::Neg, Trit::Neg, Trit::Pos]), Some(Trit::Neg));
+        assert_eq!(
+            dominant_trit(&[Trit::Pos, Trit::Pos, Trit::Neg]),
+            Some(Trit::Pos)
+        );
+        assert_eq!(
+            dominant_trit(&[Trit::Neg, Trit::Neg, Trit::Pos]),
+            Some(Trit::Neg)
+        );
         assert_eq!(dominant_trit(&[Trit::Zero, Trit::Zero]), None);
         assert_eq!(dominant_trit(&[]), None);
     }
