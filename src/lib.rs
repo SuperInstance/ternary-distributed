@@ -753,6 +753,51 @@ mod tests {
     }
 
     #[test]
+    fn test_partition_detector_timeout_boundary() {
+        // is_alive uses `current_round - last_seen <= timeout`. Verify the
+        // exact boundary: alive at exactly `timeout_rounds`, dead one round
+        // later. Also exercise alive_nodes() vs partitioned_nodes().
+        let mut pd = PartitionDetector::new(3, 2);
+        pd.heartbeat(1);
+        pd.heartbeat(2);
+        pd.heartbeat(3);
+
+        // Advance to exactly the timeout: still alive.
+        pd.advance_round(); // round 1
+        pd.advance_round(); // round 2
+        assert_eq!(pd.current_round, 2);
+        assert!(pd.is_alive(1));
+        assert_eq!(pd.alive_nodes().len(), 3);
+        assert_eq!(pd.partitioned_nodes().len(), 0);
+
+        // One more round: now timed out.
+        pd.advance_round(); // round 3
+        assert!(!pd.is_alive(1));
+        assert_eq!(pd.alive_nodes().len(), 0);
+        assert_eq!(pd.partitioned_nodes().len(), 3);
+    }
+
+    #[test]
+    fn test_partition_detector_unknown_node_not_alive() {
+        // A node we have never heard from is not alive and not counted.
+        let pd = PartitionDetector::new(3, 2);
+        assert!(!pd.is_alive(99));
+        assert_eq!(pd.alive_nodes().len(), 0);
+    }
+
+    #[test]
+    fn test_partition_detector_quorum_strict_majority() {
+        // has_quorum requires a STRICT majority (alive*2 > total).
+        let mut pd = PartitionDetector::new(4, 5);
+        pd.heartbeat(1);
+        pd.heartbeat(2);
+        assert_eq!(pd.alive_nodes().len(), 2);
+        assert!(!pd.has_quorum(), "2 of 4 is exactly half, not a quorum");
+        pd.heartbeat(3);
+        assert!(pd.has_quorum(), "3 of 4 is a strict majority");
+    }
+
+    #[test]
     fn test_consensus_prepare_promise() {
         let mut cp = ConsensusProtocol::new(&[1, 2, 3]);
         let proposal = cp.prepare(1);
@@ -859,19 +904,65 @@ mod tests {
 
     #[test]
     fn test_anti_entropy_sync_pair() {
+        // Construct an actual causal relationship: n2 has a tick on its own
+        // counter, n1 has none, so vc(n1) happened-before vc(n2). Sync must
+        // bring n1 forward to adopt n2's state and advance n1's clock.
         let mut sync = AntiEntropySync::new();
         let mut n1 = TernaryNode::with_state(1, Trit::Pos);
         n1.add_peer(2);
-        let mut n2 = TernaryNode::new(2);
+        let mut n2 = TernaryNode::with_state(2, Trit::Neg);
         n2.add_peer(1);
-        n2.vector_clock.increment(2); // Give n2 a clock
+        n2.vector_clock.increment(2); // n2 is causally newer
         sync.add_node(n1);
         sync.add_node(n2);
+
+        let changed = sync.sync_pair(1, 2);
+        assert!(changed, "sync_pair should report a change");
+
+        // n1 (behind) adopts n2's state; n2 (ahead) is unchanged.
+        assert_eq!(sync.nodes.get(&1).unwrap().state, Trit::Neg);
+        assert_eq!(sync.nodes.get(&2).unwrap().state, Trit::Neg);
+        // n1's clock must have advanced past its previously-empty state.
+        assert!(sync.nodes.get(&1).unwrap().vector_clock.get(1) >= 1);
+        assert!(sync.nodes.get(&1).unwrap().vector_clock.get(2) >= 1);
+    }
+
+    #[test]
+    fn test_anti_entropy_sync_pair_concurrent() {
+        // Two nodes with concurrent clocks (each ticked its own counter) must
+        // reconcile to the dominant trit.
+        let mut sync = AntiEntropySync::new();
+        let mut n1 = TernaryNode::with_state(1, Trit::Pos);
+        n1.add_peer(2);
+        n1.vector_clock.increment(1);
+        let mut n2 = TernaryNode::with_state(2, Trit::Neg);
+        n2.add_peer(1);
+        n2.vector_clock.increment(2);
+        sync.add_node(n1);
+        sync.add_node(n2);
+
+        // dominant_trit([Pos, Neg]) ties toward Pos.
         sync.sync_pair(1, 2);
-        // n2 should adopt n1's state since n1 has state set via with_state
-        // but n1's vc is empty while n2 has a tick
-        let state2 = sync.nodes.get(&2).unwrap().state;
-        assert_eq!(state2, Trit::Zero); // n2 already zero, n1 has no vc ticks
+        assert_eq!(sync.nodes.get(&1).unwrap().state, Trit::Pos);
+        assert_eq!(sync.nodes.get(&2).unwrap().state, Trit::Pos);
+    }
+
+    #[test]
+    fn test_anti_entropy_sync_pair_noop_when_equal() {
+        // Identical state + clock: sync_pair must report no change and not
+        // spuriously advance clocks.
+        let mut sync = AntiEntropySync::new();
+        let mut n1 = TernaryNode::with_state(1, Trit::Pos);
+        n1.add_peer(2);
+        n1.vector_clock.increment(1);
+        let mut n2 = TernaryNode::with_state(2, Trit::Pos);
+        n2.add_peer(1);
+        n2.vector_clock.increment(1);
+        sync.add_node(n1);
+        sync.add_node(n2);
+
+        let changed = sync.sync_pair(1, 2);
+        assert!(!changed);
     }
 
     #[test]
